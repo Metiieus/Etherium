@@ -18,25 +18,30 @@ import { useAuth } from "@/_core/hooks/useAuth";
 import { useWebRTC } from "@/_core/hooks/useWebRTC";
 import { useToast } from "@/hooks/use-toast";
 import { db, storage } from "@/lib/firebase";
-import { collection, query, where, onSnapshot, doc, updateDoc, getDoc, arrayUnion, addDoc, serverTimestamp, orderBy } from "firebase/firestore";
+import { collection, query, where, onSnapshot, doc, updateDoc, getDoc, arrayUnion, orderBy } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { useGameStore } from "@/store/gameStore";
 import { ChatPanel } from "@/components/game-session/ChatPanel";
 import { InitiativePanel } from "@/components/game-session/InitiativePanel";
 import { DicePanel } from "@/components/game-session/DicePanel";
 import { ToolsMenu } from "@/components/game-session/ToolsMenu";
+import { GameScene } from "@/components/game-session/GameScene";
 
 export default function GameSession() {
     const { id } = useParams();
     const { user } = useAuth();
     const { toast } = useToast();
 
-    // Store State
+    // Store State & Actions
     const {
         activeTool, setActiveTool,
         inspectorView, setInspectorView,
         campaign, setCampaign,
-        characters, setCharacters
+        characters, setCharacters,
+        chatMessages, setChatMessages,
+        journalEntries, setJournalEntries,
+        sendMessage, addJournalEntry, updateCharacter, updateCampaignData,
+        addToInitiative, removeFromInitiative, nextTurn, sortInitiative, resetInitiative
     } = useGameStore();
 
     // UI States (Local)
@@ -47,41 +52,34 @@ export default function GameSession() {
     const videoRef = useRef<HTMLVideoElement>(null);
 
     // Data States (Local - specific to actions)
-    const [xpAmount, setXpAmount] = useState(100);
     const [itemName, setItemName] = useState("");
     const [selectedCharId, setSelectedCharId] = useState<string | null>(null);
     const [itemImage, setItemImage] = useState("");
     const [itemFile, setItemFile] = useState<File | null>(null);
 
-    // Inspector State (Local)
+    // Inspector State (Local - temporary UI values)
     const [inspectorCharId, setInspectorCharId] = useState<string | null>(null);
     const [damageInput, setDamageInput] = useState(0);
     const [conditionInput, setConditionInput] = useState("Cegueira");
     const [showGiveItem, setShowGiveItem] = useState(false);
     const [abilityPointsInput, setAbilityPointsInput] = useState(0);
 
-    // Initiative State (Local)
+    // Initiative State (Local - temporary UI values)
     const [newInitName, setNewInitName] = useState("");
-    const [newInitValue, setNewInitValue] = useState(0);
+    const [newInitValue, setNewInitValue] = useState(0); // Kept locally for inputs
 
-    // WebRTC Logic
-    const isMaster = campaign?.masterId === user?.id; // Re-computed later but needed for hook
-    const { remoteStream, setLocalStream } = useWebRTC(id, user?.id, isMaster || false);
-
-    // Chat State with Explicit Type
-    const [chatMessages, setChatMessages] = useState<{ id: string | number; user: string; text: string; time: string; role: string; }[]>([
-        { id: 1, user: "Sistema", text: "Bem-vindo à sessão de jogo!", time: "Agora", role: "system" },
-    ]);
-
-    // Computed
+    // Derived State
+    const isMaster = campaign?.masterId === user?.id;
     const playerCharacter = characters.find((c: any) => c.userId === user?.id);
     const selectedCharForInspector = characters.find((c: any) => c.id === inspectorCharId);
+
+    // WebRTC Logic
+    const { remoteStream, setLocalStream } = useWebRTC(id, user?.id, isMaster || false);
 
     // Fetch Campaign & Characters
     useEffect(() => {
         if (!id) return;
 
-        // Fetch Campaign
         // Fetch Campaign (Realtime)
         const unsubCampaign = onSnapshot(doc(db, "campaigns", id), (snap) => {
             if (snap.exists()) setCampaign({ id: snap.id, ...snap.data() });
@@ -94,87 +92,63 @@ export default function GameSession() {
             setCharacters(chars);
         });
         return () => { unsubscribe(); unsubCampaign(); };
-    }, [id]);
+    }, [id, setCampaign, setCharacters]);
 
     // Presence Logic
     useEffect(() => {
         if (!playerCharacter) return;
-
-        // Mark as Online on entry
         const charRef = doc(db, "characters", playerCharacter.id);
         if (!playerCharacter.isOnline) {
-            updateDoc(charRef, { isOnline: true }).catch(console.error);
+            updateCharacter(playerCharacter.id, { isOnline: true });
         }
-
-        // Cleanup: Mark as Offline on simple unmount
         return () => {
-            // We use a beacon or simple update if possible, but for SPA navigation:
-            updateDoc(charRef, { isOnline: false }).catch(console.error);
+            updateCharacter(playerCharacter.id, { isOnline: false });
         };
-    }, [playerCharacter?.id]);
+    }, [playerCharacter?.id]); // Depend only on ID stability
 
     // Handle explicit exit
     const handleExit = async () => {
         if (playerCharacter) {
-            await updateDoc(doc(db, "characters", playerCharacter.id), { isOnline: false });
+            await updateCharacter(playerCharacter.id, { isOnline: false });
         }
-        window.location.href = "/campaigns"; // Hard navigation to ensure clean state or useLocation
+        window.location.href = "/campaigns";
     };
 
-    // Message & Journal Subscriptions
-    const [journalEntries, setJournalEntries] = useState<any[]>([]);
-
+    // Chat Subscription
     useEffect(() => {
         if (!id) return;
-
-        // Chat Subscription
-        const qChat = query(collection(db, "campaigns", id, "chat"), orderBy("createdAt", "asc")); // Ensure index exists or use client sort if small
+        const qChat = query(collection(db, "campaigns", id, "chat"), orderBy("createdAt", "asc"));
         const unsubChat = onSnapshot(qChat, (snapshot) => {
             setChatMessages(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as any)));
         });
+        return () => unsubChat();
+    }, [id, setChatMessages]);
 
-        // Journal Subscription
+    // Journal Subscription
+    useEffect(() => {
+        if (!id) return;
         const qJournal = query(collection(db, "campaigns", id, "journal"), orderBy("createdAt", "desc"));
         const unsubJournal = onSnapshot(qJournal, (snapshot) => {
             setJournalEntries(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
         });
+        return () => unsubJournal();
+    }, [id, setJournalEntries]);
 
-        return () => { unsubChat(); unsubJournal(); };
-    }, [id]);
 
-    // Helper to Log System Actions
-    const logSystemAction = async (text: string, type: 'system' | 'master' | 'red' | 'green' = 'master') => {
-        if (!id) return;
-        try {
-            await addDoc(collection(db, "campaigns", id, "chat"), {
-                user: "O Mestre",
-                text,
-                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                role: type,
-                createdAt: serverTimestamp()
-            });
-        } catch (error) { console.error("Error logging action:", error); }
-    };
-
-    // Media Stream Setup (Corrected for Players too)
+    // Media Stream Setup
     useEffect(() => {
         let stream: MediaStream | null = null;
-
         const startVideo = async () => {
-            if (isCamOn) { // Removed isMaster check to allow players to see themselves
+            if (isCamOn) {
                 try {
                     stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                    if (videoRef.current) {
-                        videoRef.current.srcObject = stream;
-                    }
-                    if (isMaster) setLocalStream(stream); // Broadcast stream
+                    if (videoRef.current) videoRef.current.srcObject = stream;
+                    if (isMaster) setLocalStream(stream); // Broadcast if master
                 } catch (err: any) {
-                    console.warn("Failed to get video+audio, trying video only...", err);
+                    console.warn("Retrying video only...", err);
                     try {
                         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                        if (videoRef.current) {
-                            videoRef.current.srcObject = stream;
-                        }
+                        if (videoRef.current) videoRef.current.srcObject = stream;
                         toast({ title: "Microfone indisponível", description: "Iniciando com vídeo.", variant: "default" });
                     } catch (err2: any) {
                         console.error("Webcam error:", err2);
@@ -190,51 +164,30 @@ export default function GameSession() {
                 }
             }
         };
-
-        // Small timeout to ensure ref is mounted when switching views
         setTimeout(startVideo, 100);
-
         return () => {
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
-            }
+            if (stream) stream.getTracks().forEach(track => track.stop());
         };
-    }, [isCamOn, playerCharacter]); // Removed isMaster dependency to fix player cam
+    }, [isCamOn, isMaster]); // Add isMaster to deps if it affects broadcasting
 
-    const handleSendMessage = async () => {
-        if (!msgInput.trim() || !id) return;
-        try {
-            await addDoc(collection(db, "campaigns", id, "chat"), {
-                user: user?.name || "Jogador",
-                text: msgInput,
-                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                role: isMaster ? 'master' : 'player',
-                createdAt: serverTimestamp()
-            });
-            setMsgInput("");
-        } catch (error) { console.error("Error sending message:", error); }
+    // Handlers
+    const handleSendMessageWrapper = async () => {
+        if (!id) return;
+        await sendMessage(id, msgInput, user, isMaster ? 'master' : 'player');
+        setMsgInput("");
     };
 
-    // New State for Journal Input since it was missing or impromptu
     const [journalInput, setJournalInput] = useState("");
-
-    const handleAddJournal = async () => {
-        if (!journalInput.trim() || !id) return;
-        try {
-            await addDoc(collection(db, "campaigns", id, "journal"), {
-                text: journalInput,
-                author: user?.name || "Mestre",
-                createdAt: serverTimestamp(), // Use serverTimestamp for sorting
-                displayDate: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) // Display string
-            });
-            setJournalInput("");
-            toast({ title: "Diário Atualizado" });
-        } catch (error) { console.error("Error adding journal:", error); }
+    const handleAddJournalWrapper = async () => {
+        if (!id) return;
+        await addJournalEntry(id, journalInput, user?.name || "Mestre");
+        setJournalInput("");
+        toast({ title: "Diário Atualizado" });
     };
 
     const rollDice = (sides: number) => {
         const result = Math.floor(Math.random() * sides) + 1;
-        logSystemAction(`${user?.name} rolou um d${sides}:🎲 ${result}`, 'system');
+        if (id) sendMessage(id, `${user?.name} rolou um d${sides}:🎲 ${result}`, user, 'system');
     };
 
     const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -243,23 +196,18 @@ export default function GameSession() {
             const reader = new FileReader();
             reader.onloadend = () => {
                 setMapImage(reader.result as string);
-                toast({ title: "Mapa Atualizado", description: "Imagem carregada do computador." });
+                toast({ title: "Mapa Atualizado" });
             };
             reader.readAsDataURL(file);
         }
     };
 
     const giveXp = async (charId: string, amount: number) => {
-        try {
-            const charRef = doc(db, "characters", charId);
-            const charSnap = await getDoc(charRef);
-            if (charSnap.exists()) {
-                const currentXp = charSnap.data().xp || 0;
-                await updateDoc(charRef, { xp: currentXp + amount });
-                toast({ title: "XP Concedido!", description: `${amount} XP adicionado.` });
-                logSystemAction(`Concedeu ${amount} XP para ${charSnap.data().name}`, 'master');
-            }
-        } catch (error) { console.error(error); }
+        const char = characters.find((c: any) => c.id === charId);
+        if (!char) return;
+        await updateCharacter(charId, { xp: (char.xp || 0) + amount });
+        toast({ title: "XP Concedido!", description: `${amount} XP adicionado.` });
+        if (id) sendMessage(id, `Concedeu ${amount} XP para ${char.name}`, user, 'master');
     };
 
     const handleItemUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -268,8 +216,8 @@ export default function GameSession() {
             const reader = new FileReader();
             reader.onloadend = () => {
                 setItemImage(reader.result as string);
-                setItemFile(file); // Store file for upload
-                toast({ title: "Carta Carregada", description: "Imagem do item pronta para enviar." });
+                setItemFile(file);
+                toast({ title: "Carta Carregada" });
             };
             reader.readAsDataURL(file);
         }
@@ -277,14 +225,12 @@ export default function GameSession() {
 
     const giveItem = async (charId: string, item: string, img: string) => {
         if (!item || !img) {
-            toast({ title: "Erro", description: "Nome e Imagem são obrigatórios para cartas.", variant: "destructive" });
+            toast({ title: "Erro", description: "Nome e Imagem obrigatórios.", variant: "destructive" });
             return;
         }
         try {
             let finalImageUrl = img;
-
-            // Upload to Storage if a file was selected
-            if (itemFile) {
+            if (itemFile && id) {
                 const storageRef = ref(storage, `campaign_uploads/${id}/items/${Date.now()}_${itemFile.name}`);
                 const snapshot = await uploadBytes(storageRef, itemFile);
                 finalImageUrl = await getDownloadURL(snapshot.ref);
@@ -294,163 +240,90 @@ export default function GameSession() {
             await updateDoc(charRef, {
                 inventory: arrayUnion({ name: item, type: "card", imageUrl: finalImageUrl, addedAt: new Date().toISOString() })
             });
-            toast({ title: "Carta Enviada!", description: `${item} adicionado ao inventário.` });
+
+            toast({ title: "Carta Enviada!" });
             const char = characters.find((c: any) => c.id === charId);
-            logSystemAction(`Concedeu o item ${item} para ${characters.find((c: any) => c.id === charId)?.name}.`, 'master');
-            setItemName("");
-            setItemImage("");
-            setItemFile(null);
-        } catch (error) {
-            console.error(error);
-            toast({ title: "Erro ao enviar item", description: String(error), variant: "destructive" });
+            if (id) sendMessage(id, `Concedeu o item ${item} para ${char?.name}.`, user, 'master');
+            setItemName(""); setItemImage(""); setItemFile(null);
+        } catch (error) { toast({ title: "Erro", description: String(error), variant: "destructive" }); }
+    };
+
+    const updateAbilityPointsWrapper = async (charId: string, value: number) => {
+        const char = characters.find((c: any) => c.id === charId);
+        if (!char) return;
+        const current = char.abilityPoints || 0;
+        const max = char.maxAbilityPoints || 10;
+        const newValue = Math.min(max, Math.max(0, current + value));
+        await updateCharacter(charId, { abilityPoints: newValue });
+        toast({ title: "Pontos de Habilidade Atualizados" });
+        if (value !== 0 && id) {
+            sendMessage(id, `${value > 0 ? 'Restaurou' : 'Drenou'} ${Math.abs(value)} ponto(s) de habilidade de ${char.name}.`, user, 'master');
         }
+        setAbilityPointsInput(0);
     };
 
-    const updateAbilityPoints = async (charId: string, value: number) => {
-        try {
-            const charRef = doc(db, "characters", charId);
-            const char = characters.find((c: any) => c.id === charId);
-            if (!char) return;
-            const current = char.abilityPoints || 0;
-            const max = char.maxAbilityPoints || 10;
-            const newValue = Math.min(max, Math.max(0, current + value));
+    const applyDamageWrapper = async (charId: string, amount: number, type: 'damage' | 'heal') => {
+        const char = characters.find((c: any) => c.id === charId);
+        if (!char) return;
+        const currentHp = char.hp || 0;
+        const maxHp = char.maxHp || 100;
+        let newHp = type === 'damage' ? Math.max(0, currentHp - amount) : Math.min(maxHp, currentHp + amount);
 
-            await updateDoc(charRef, { abilityPoints: newValue });
-            toast({ title: "Pontos de Habilidade Atualizados" });
-
-            if (value !== 0) {
-                logSystemAction(`${value > 0 ? 'Restaurou' : 'Drenou'} ${Math.abs(value)} ponto(s) de habilidade de ${char.name}.`, 'master');
-            }
-
-            setAbilityPointsInput(0);
-        } catch (error) { console.error(error); }
+        await updateCharacter(charId, { hp: newHp });
+        toast({ title: type === 'damage' ? "Dano Aplicado" : "Cura Aplicada" });
+        if (id) sendMessage(id, `${type === 'damage' ? 'Causou' : 'Curou'} ${amount} de ${type === 'damage' ? 'dano a' : 'vida de'} ${char.name}. (HP: ${newHp}/${maxHp})`, user, 'master');
+        setDamageInput(0);
     };
 
-    const applyDamage = async (charId: string, amount: number, type: 'damage' | 'heal') => {
-        try {
-            const charRef = doc(db, "characters", charId);
-            const char = characters.find((c: any) => c.id === charId);
-            if (!char) return;
+    const toggleConditionWrapper = async (charId: string, condition: string) => {
+        const char = characters.find((c: any) => c.id === charId);
+        if (!char) return;
+        const currentConditions = char.conditions || [];
+        let newConditions;
+        let action = "";
 
-            const currentHp = char.hp || 0;
-            const maxHp = char.maxHp || 100; // Default max if not set
-            let newHp = currentHp;
-
-            if (type === 'damage') {
-                newHp = Math.max(0, currentHp - amount);
-                logSystemAction(`Causou ${amount} de dano a ${char.name}. (HP: ${newHp}/${maxHp})`, 'master');
-            } else {
-                newHp = Math.min(maxHp, currentHp + amount);
-                logSystemAction(`Curou ${amount} de vida de ${char.name}. (HP: ${newHp}/${maxHp})`, 'master');
-            }
-
-            await updateDoc(charRef, { hp: newHp });
-            toast({ title: type === 'damage' ? "Dano Aplicado" : "Cura Aplicada" });
-            setDamageInput(0);
-        } catch (error) { console.error(error); }
-    };
-
-    const toggleCondition = async (charId: string, condition: string) => {
-        try {
-            const charRef = doc(db, "characters", charId);
-            const char = characters.find((c: any) => c.id === charId);
-            if (!char) return;
-
-            const currentConditions = char.conditions || [];
-            let newConditions;
-
-            if (currentConditions.includes(condition)) {
-                newConditions = currentConditions.filter((c: string) => c !== condition);
-                toast({ title: "Condição Removida", description: condition });
-                logSystemAction(`Removeu a condição '${condition}' de ${char.name}.`, 'master');
-            } else {
-                newConditions = [...currentConditions, condition];
-                toast({ title: "Condição Aplicada", description: condition });
-                logSystemAction(`Aplicou a condição '${condition}' em ${char.name}.`, 'master');
-            }
-
-            await updateDoc(charRef, { conditions: newConditions });
-        } catch (error) { console.error(error); }
-    };
-
-    // --- INITIATIVE TRACKER LOGIC ---
-
-    const addToInitiative = async (name: string, value: number, isNpc = true) => {
-        if (!campaign) return;
-        const currentList = campaign.initiativeList || [];
-        const newItem = { id: Date.now().toString(), name, value, isNpc };
-        const newList = [...currentList, newItem].sort((a: any, b: any) => b.value - a.value);
-
-        await updateDoc(doc(db, "campaigns", campaign.id), {
-            initiativeList: newList
-        });
-        setNewInitName("");
-        setNewInitValue(0);
-    };
-
-    const removeFromInitiative = async (itemId: string) => {
-        if (!campaign) return;
-        const currentList = campaign.initiativeList || [];
-        const newList = currentList.filter((i: any) => i.id !== itemId);
-        await updateDoc(doc(db, "campaigns", campaign.id), {
-            initiativeList: newList
-        });
-    };
-
-    const nextTurn = async () => {
-        if (!campaign || !campaign.initiativeList || campaign.initiativeList.length === 0) return;
-        const currentIdx = campaign.currentTurnIndex ?? -1;
-        let nextIdx = currentIdx + 1;
-        let round = campaign.round ?? 1;
-
-        if (nextIdx >= campaign.initiativeList.length) {
-            nextIdx = 0;
-            round += 1;
-            logSystemAction(`🟢 Nova Rodada Iniciada: Rodada ${round}`, 'system');
+        if (currentConditions.includes(condition)) {
+            newConditions = currentConditions.filter((c: string) => c !== condition);
+            action = `Removeu a condição '${condition}' de`;
+        } else {
+            newConditions = [...currentConditions, condition];
+            action = `Aplicou a condição '${condition}' em`;
         }
 
-        await updateDoc(doc(db, "campaigns", campaign.id), {
-            currentTurnIndex: nextIdx,
-            round: round
-        });
-
-        // Notify who's turn it is
-        const currentEntity = campaign.initiativeList[nextIdx];
-        if (currentEntity) {
-            toast({ title: "Turno de", description: currentEntity.name });
-        }
+        await updateCharacter(charId, { conditions: newConditions });
+        toast({ title: "Condições Atualizadas" });
+        if (id) sendMessage(id, `${action} ${char.name}.`, user, 'master');
     };
 
-    const sortInitiative = async () => {
-        if (!campaign || !campaign.initiativeList) return;
-        const sorted = [...campaign.initiativeList].sort((a: any, b: any) => b.value - a.value);
-        await updateDoc(doc(db, "campaigns", campaign.id), {
-            initiativeList: sorted,
-            currentTurnIndex: 0
-        });
+    // Initiative Wrappers
+    const addToInitiativeWrapper = async (name: string, value: number) => {
+        if (!campaign?.id) return;
+        await addToInitiative(campaign.id, campaign.initiativeList, name, value, true);
+        setNewInitName(""); setNewInitValue(0);
     };
-
-    const resetInitiative = async () => {
-        if (!confirm("Limpar toda a iniciativa?")) return;
-        await updateDoc(doc(db, "campaigns", campaign.id), {
-            initiativeList: [],
-            currentTurnIndex: 0,
-            round: 1
-        });
-    };
+    const removeFromInitiativeWrapper = (itemId: string) => campaign?.id && removeFromInitiative(campaign.id, campaign.initiativeList, itemId);
+    const nextTurnWrapper = () => campaign?.id && nextTurn(campaign.id, campaign.initiativeList, campaign.currentTurnIndex, campaign.round);
+    const sortInitiativeWrapper = () => campaign?.id && sortInitiative(campaign.id, campaign.initiativeList);
+    const resetInitiativeWrapper = () => campaign?.id && confirm("Limpar toda a iniciativa?") && resetInitiative(campaign.id);
 
     return (
         <div className="h-screen w-screen bg-black text-foreground font-sans overflow-hidden flex flex-col relative select-none">
             {/* Background Map/Scene */}
-            <div className="absolute inset-0 z-0">
-                <div className="absolute inset-0 bg-black/60 z-10 pointer-events-none" />
-                <img src={mapImage} alt="Map" className="w-full h-full object-cover opacity-50" />
+            {/* Game Scene Layer (Z-0) */}
+            <div className="absolute inset-0 z-0 bg-neutral-900 pointer-events-auto">
+                {campaign && (
+                    <GameScene
+                        campaign={campaign}
+                        characters={characters}
+                        isMaster={isMaster || false}
+                    />
+                )}
             </div>
 
-            {/* Main Content Overlay */}
-            <div className="relative z-10 h-full flex flex-col">
+            {/* Main Content Overlay (Click-through) */}
+            <div className="relative z-10 h-full flex flex-col pointer-events-none">
                 {/* 1. Top Bar (Header) */}
-                <header className="h-14 bg-black/80 border-b border-accent/20 flex items-center justify-between px-4 shrink-0 backdrop-blur-md">
+                <header className="h-14 bg-black/80 border-b border-accent/20 flex items-center justify-between px-4 shrink-0 backdrop-blur-md pointer-events-auto">
                     <div className="flex items-center gap-4">
                         <Link href="/campaigns" className="text-accent/80 hover:text-accent transition-colors"><ChevronRight className="w-5 h-5 rotate-180" /></Link>
                         <div>
@@ -491,21 +364,46 @@ export default function GameSession() {
                 {/* 2. Game Area */}
                 <div className="flex-1 flex overflow-hidden">
                     {/* Left: Chat & Journal */}
-                    <div className="p-2 flex flex-col gap-2">
-                        <ChatPanel messages={chatMessages} onSend={(text) => { setMsgInput(text); handleSendMessage(); }} />
+                    <div className="p-2 flex flex-col gap-2 w-[300px] shrink-0 pointer-events-auto">
+                        <ChatPanel messages={chatMessages} onSend={(text) => { setMsgInput(text); handleSendMessageWrapper(); }} />
                     </div>
 
-                    {/* Center: Canvas/Map - Placeholder for now, keeping simple div */}
+                    {/* Center: Canvas/Map */}
                     <div className="flex-1 flex flex-col min-w-0">
-                        {/* Round Counter Overlay */}
                         {(campaign?.initiativeList?.length || 0) > 0 && (campaign?.round || 1) > 1 && (
                             <div className="absolute top-20 left-1/2 -translate-x-1/2 bg-black/80 text-accent px-6 py-2 rounded-full border border-accent/30 shadow-[0_0_20px_rgba(234,179,8,0.2)] backdrop-blur text-xl font-cinzel font-bold animate-in fade-in slide-in-from-top-4 z-50 pointer-events-none">
                                 ROUND {campaign.round}
                             </div>
                         )}
-                        <div className="h-[350px] flex gap-2 p-2 pt-0 w-full mt-auto mb-10">
-                            {/* Tools Container */}
-                            <Card className="flex-1 bg-slate-950/90 border-accent/20 backdrop-blur-md flex flex-col p-3 overflow-hidden shadow-2xl relative">
+                        <div className="mt-auto mb-4 mx-4 flex items-end gap-4 h-[350px] pointer-events-auto">
+                            {/* Master Camera - Large Square */}
+                            <Card className="h-[350px] w-[350px] bg-black/90 border-none overflow-hidden relative shrink-0 shadow-2xl rounded-xl flex items-center justify-center bg-zinc-950 ring-0">
+                                <div className="absolute inset-0 flex items-center justify-center text-muted-foreground text-xs">
+                                    {!isMaster && !remoteStream && "Aguardando Mestre..."}
+                                </div>
+                                {isMaster && (
+                                    <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1]" />
+                                )}
+                                {!isMaster && remoteStream && (
+                                    <video
+                                        ref={ref => { if (ref) ref.srcObject = remoteStream; }}
+                                        autoPlay
+                                        playsInline
+                                        className="w-full h-full object-cover"
+                                    />
+                                )}
+                                {/* Custom Frame Overlay */}
+                                <div className="absolute inset-0 z-20 pointer-events-none">
+                                    <img src="/master-frame.png" alt="Master Frame" className="w-full h-full object-fill" />
+                                </div>
+                                <div className="absolute bottom-10 left-0 right-0 p-2 z-30 pointer-events-none">
+                                    <p className="text-xs font-bold text-accent text-center uppercase tracking-widest flex items-center justify-center gap-2 shadow-black drop-shadow-md bg-black/40 backdrop-blur w-fit mx-auto px-3 py-1 rounded-full border border-accent/20">
+                                        <Crown className="w-3 h-3" /> Mestre
+                                    </p>
+                                </div>
+                            </Card>
+
+                            <Card className="flex-1 h-full bg-slate-950/90 border-accent/20 backdrop-blur-md flex flex-col p-3 overflow-hidden shadow-2xl relative rounded-xl">
                                 {activeTool ? (
                                     <div className="h-full flex flex-col animate-in slide-in-from-right-10 duration-300 min-h-0">
                                         <div className="flex justify-between items-center mb-3 border-b border-white/5 pb-2 shrink-0">
@@ -513,32 +411,92 @@ export default function GameSession() {
                                                 {activeTool === 'initiative' ? <><Sword className="w-4 h-4" /> Iniciativa</> :
                                                     activeTool === 'dice' ? <><Dices className="w-4 h-4" /> Rolador</> :
                                                         activeTool === 'chat' ? <><MessageSquare className="w-4 h-4" /> Chat</> :
-                                                            activeTool.charAt(0).toUpperCase() + activeTool.slice(1)}
+                                                            activeTool === 'scenes' ? <><MapIcon className="w-4 h-4" /> Cenas & Mapas</> :
+                                                                activeTool === 'journal' ? <><Settings className="w-4 h-4" /> Diário</> :
+                                                                    activeTool.charAt(0).toUpperCase() + activeTool.slice(1)}
                                             </h3>
                                             <Button variant="ghost" size="sm" className="h-6 w-6 p-0 hover:bg-red-500/20 hover:text-red-500" onClick={() => setActiveTool(null)}>
                                                 <ChevronRight className="w-4 h-4" />
                                             </Button>
                                         </div>
 
-                                        {/* RENDER ACTIVE TOOL COMPONENT */}
+                                        {/* SCENES / MAP MANAGER */}
+                                        {activeTool === 'scenes' && isMaster && (
+                                            <div className="flex flex-col gap-4 overflow-y-auto pr-2">
+                                                <div className="space-y-2">
+                                                    <Label className="text-xs text-muted-foreground">URL do Mapa</Label>
+                                                    <div className="flex gap-2">
+                                                        <Input
+                                                            value={mapImage}
+                                                            onChange={(e) => setMapImage(e.target.value)}
+                                                            className="bg-black/50 border-white/10 h-8 text-xs"
+                                                            placeholder="https://..."
+                                                        />
+                                                        <Button size="sm" onClick={() => campaign?.id && updateCampaignData(campaign.id, { activeMapUrl: mapImage })} className="h-8">
+                                                            <Send className="w-3 h-3" />
+                                                        </Button>
+                                                    </div>
+                                                </div>
+                                                <div className="space-y-2">
+                                                    <Label className="text-xs text-muted-foreground">Upload de Mapa</Label>
+                                                    <Input type="file" onChange={handleFileUpload} className="bg-black/50 border-white/10 text-xs" />
+                                                </div>
+                                                <div className="space-y-2 border-t border-white/10 pt-2">
+                                                    <Label className="text-xs text-muted-foreground">Fog of War (Em Breve)</Label>
+                                                    <Button disabled variant="outline" size="sm" className="w-full h-8 text-xs border-dashed">Ativar Nevoeiro</Button>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* JOURNAL */}
+                                        {activeTool === 'journal' && (
+                                            <div className="flex flex-col h-full overflow-hidden">
+                                                <ScrollArea className="flex-1 pr-2">
+                                                    <div className="flex flex-col gap-2">
+                                                        {journalEntries.map((entry: any) => (
+                                                            <div key={entry.id} className="bg-black/40 p-2 rounded border border-white/5">
+                                                                <p className="text-[10px] text-accent mb-1">{entry.createdAt?.toDate ? entry.createdAt.toDate().toLocaleString() : 'Just now'} - {entry.author}</p>
+                                                                <p className="text-xs text-zinc-300 whitespace-pre-wrap">{entry.text}</p>
+                                                            </div>
+                                                        ))}
+                                                        {journalEntries.length === 0 && <p className="text-xs text-muted-foreground text-center py-4">Nenhum registro.</p>}
+                                                    </div>
+                                                </ScrollArea>
+                                                <div className="mt-2 flex gap-2 pt-2 border-t border-white/5">
+                                                    <Input
+                                                        value={journalInput}
+                                                        onChange={(e) => setJournalInput(e.target.value)}
+                                                        placeholder="Novo registro..."
+                                                        className="bg-black/50 border-white/10 h-8 text-xs"
+                                                    />
+                                                    <Button size="sm" onClick={handleAddJournalWrapper} className="h-8"><Send className="w-3 h-3" /></Button>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* INSPECTOR (Placeholder) */}
+                                        {activeTool === 'inspector' && (
+                                            <div className="flex flex-col gap-2 text-center py-10">
+                                                <Settings className="w-8 h-8 mx-auto text-muted-foreground opacity-50" />
+                                                <p className="text-xs text-muted-foreground">Selecione um token no mapa ou clique em um jogador para editar.</p>
+                                            </div>
+                                        )}
+
+                                        {/* EXISTING TOOLS */}
                                         {activeTool === 'initiative' && (
                                             <InitiativePanel
                                                 campaign={campaign}
                                                 isMaster={isMaster || false}
-                                                onAdd={addToInitiative}
-                                                onRemove={removeFromInitiative}
-                                                onNext={nextTurn}
-                                                onSort={sortInitiative}
-                                                onReset={resetInitiative}
+                                                onAdd={addToInitiativeWrapper}
+                                                onRemove={removeFromInitiativeWrapper}
+                                                onNext={nextTurnWrapper}
+                                                onSort={sortInitiativeWrapper}
+                                                onReset={resetInitiativeWrapper}
                                             />
                                         )}
                                         {activeTool === 'dice' && (
-                                            <DicePanel
-                                                chatMessages={chatMessages}
-                                                onRoll={rollDice}
-                                            />
+                                            <DicePanel chatMessages={chatMessages} onRoll={rollDice} />
                                         )}
-                                        {/* Fallback or other tools */}
                                     </div>
                                 ) : (
                                     <ToolsMenu isMaster={isMaster || false} activeTool={activeTool} onSelectTool={setActiveTool} />
@@ -548,11 +506,24 @@ export default function GameSession() {
                     </div>
 
                     {/* Right Sidebar: Player Webcams */}
-                    <div className="w-64 bg-slate-950 border-l border-accent/20 flex flex-col p-2 gap-2 overflow-y-auto custom-scrollbar">
+                    <div className="w-64 bg-slate-950 border-l border-accent/20 flex flex-col p-2 gap-2 overflow-y-auto custom-scrollbar pointer-events-auto">
                         <div className="pb-2 text-center">
                             <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-widest">Jogadores ({characters.length})</span>
                         </div>
-                        {characters.map((char: any) => (
+
+                        {/* Current User Camera (Only if NOT Master) */}
+                        {!isMaster && (
+                            <div className="aspect-video bg-zinc-900 rounded border border-white/5 relative group overflow-hidden shrink-0">
+                                <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover transform scale-x-[-1]" />
+                                <div className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                                    <span className="text-xs font-bold text-white">Você</span>
+                                </div>
+                                <div className="absolute bottom-0 left-0 right-0 p-1 bg-black/60"><p className="text-xs text-white">{user?.name} (Você)</p></div>
+                            </div>
+                        )}
+
+                        {/* Other Players (Filter out Master and Self) */}
+                        {characters.filter((c: any) => c.userId !== user?.id && c.userId !== campaign?.masterId).map((char: any) => (
                             <div key={char.id} className="aspect-video bg-zinc-900 rounded border border-white/5 relative group overflow-hidden shrink-0">
                                 <div className="absolute inset-0 flex items-center justify-center bg-zinc-800">
                                     <Avatar><AvatarImage src={char.avatarUrl} /><AvatarFallback className="text-black font-bold">{char.name[0]}</AvatarFallback></Avatar>
