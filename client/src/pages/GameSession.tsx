@@ -14,9 +14,11 @@ import { Card } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/_core/hooks/useAuth";
+import { useWebRTC } from "@/_core/hooks/useWebRTC";
 import { useToast } from "@/hooks/use-toast";
-import { db } from "@/lib/firebase";
+import { db, storage } from "@/lib/firebase";
 import { collection, query, where, onSnapshot, doc, updateDoc, getDoc, arrayUnion, addDoc, serverTimestamp, orderBy } from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 
 export default function GameSession() {
     const { id } = useParams();
@@ -38,6 +40,7 @@ export default function GameSession() {
     const [itemName, setItemName] = useState("");
     const [selectedCharId, setSelectedCharId] = useState<string | null>(null);
     const [itemImage, setItemImage] = useState("");
+    const [itemFile, setItemFile] = useState<File | null>(null);
     // Inspector State
     const [inspectorCharId, setInspectorCharId] = useState<string | null>(null);
     const [damageInput, setDamageInput] = useState(0);
@@ -46,13 +49,16 @@ export default function GameSession() {
     const [abilityPointsInput, setAbilityPointsInput] = useState(0);
     const [inspectorView, setInspectorView] = useState<'combat' | 'sheet'>('combat');
 
+    // WebRTC Logic
+    const isMaster = campaign?.masterId === user?.id; // Re-computed later but needed for hook
+    const { remoteStream, setLocalStream } = useWebRTC(id, user?.id, isMaster || false);
+
     // Chat State with Explicit Type
     const [chatMessages, setChatMessages] = useState<{ id: string | number; user: string; text: string; time: string; role: string; }[]>([
         { id: 1, user: "Sistema", text: "Bem-vindo à sessão de jogo!", time: "Agora", role: "system" },
     ]);
 
     // Computed
-    const isMaster = campaign?.masterId === user?.id;
     const playerCharacter = characters.find(c => c.userId === user?.id);
     const selectedCharForInspector = characters.find(c => c.id === inspectorCharId);
 
@@ -145,6 +151,7 @@ export default function GameSession() {
                     if (videoRef.current) {
                         videoRef.current.srcObject = stream;
                     }
+                    if (isMaster) setLocalStream(stream); // Broadcast stream
                 } catch (err: any) {
                     console.warn("Failed to get video+audio, trying video only...", err);
                     try {
@@ -245,6 +252,7 @@ export default function GameSession() {
             const reader = new FileReader();
             reader.onloadend = () => {
                 setItemImage(reader.result as string);
+                setItemFile(file); // Store file for upload
                 toast({ title: "Carta Carregada", description: "Imagem do item pronta para enviar." });
             };
             reader.readAsDataURL(file);
@@ -257,15 +265,28 @@ export default function GameSession() {
             return;
         }
         try {
+            let finalImageUrl = img;
+
+            // Upload to Storage if a file was selected
+            if (itemFile) {
+                const storageRef = ref(storage, `campaign_uploads/${id}/items/${Date.now()}_${itemFile.name}`);
+                const snapshot = await uploadBytes(storageRef, itemFile);
+                finalImageUrl = await getDownloadURL(snapshot.ref);
+            }
+
             const charRef = doc(db, "characters", charId);
             await updateDoc(charRef, {
-                inventory: arrayUnion({ name: item, type: "card", imageUrl: img, addedAt: new Date().toISOString() })
+                inventory: arrayUnion({ name: item, type: "card", imageUrl: finalImageUrl, addedAt: new Date().toISOString() })
             });
             toast({ title: "Carta Enviada!", description: `${item} adicionado ao inventário.` });
             logSystemAction(`Concedeu o item ${item} para ${characters.find(c => c.id === charId)?.name}.`, 'master');
             setItemName("");
             setItemImage("");
-        } catch (error) { console.error(error); }
+            setItemFile(null);
+        } catch (error) {
+            console.error(error);
+            toast({ title: "Erro ao enviar item", description: String(error), variant: "destructive" });
+        }
     };
 
     const updateAbilityPoints = async (charId: string, value: number) => {
@@ -500,11 +521,20 @@ export default function GameSession() {
                                     )
                                 ) : (
                                     // If Player: Show Placeholder (or Remote Stream later)
-                                    <div className="w-full h-full bg-[url('https://images.unsplash.com/photo-1544005313-94ddf0286df2?q=80&w=2576&auto=format&fit=crop')] bg-cover bg-center opacity-80 relative group">
-                                        <div className="absolute inset-0 bg-black/40 flex items-center justify-center flex-col p-4 text-center">
-                                            <span className="text-xs text-white/50 uppercase tracking-widest mb-1">Câmera do Mestre</span>
-                                            <span className="text-[10px] text-accent/50 italic">(Transmissão offline)</span>
-                                        </div>
+                                    // If Player: Show Remote Stream
+                                    <div className="w-full h-full bg-zinc-900 relative group">
+                                        {remoteStream ? (
+                                            <video
+                                                ref={(ref) => { if (ref) ref.srcObject = remoteStream; }}
+                                                autoPlay playsInline
+                                                className="w-full h-full object-cover"
+                                            />
+                                        ) : (
+                                            <div className="absolute inset-0 bg-black/40 flex items-center justify-center flex-col p-4 text-center">
+                                                <span className="text-xs text-white/50 uppercase tracking-widest mb-1">Câmera do Mestre</span>
+                                                <span className="text-[10px] text-accent/50 italic">(Aguardando sinal...)</span>
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                             </div>
